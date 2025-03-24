@@ -18,7 +18,7 @@ class VinChecker:
         self.vin = os.getenv('VIN_NUMBER')
         self.chat_id = os.getenv('CHAT_ID')
         
-        # Валидация переменных (Улучшение 3)
+        # Валидация переменных
         if not all([self.bot.token, self.vin, self.chat_id]):
             raise ValueError("TELEGRAM_TOKEN, VIN_NUMBER, and CHAT_ID must be set in .env")
         if not self.chat_id.isdigit():
@@ -47,7 +47,7 @@ class VinChecker:
         self.bot.reply_to(message, "Я понимаю только команды /start, /help и /check.")
 
     def start(self):
-        """Запуск бота и периодических проверок с перезапуском при сбоях (Улучшение 2)"""
+        """Запуск бота и периодических проверок с перезапуском при сбоях"""
         self.scheduler.start()
         logging.info("Периодические проверки запущены")
         while True:
@@ -58,7 +58,7 @@ class VinChecker:
                 time.sleep(5)  # Задержка перед перезапуском
 
     def automatic_check(self):
-        """Автоматическая проверка с обработкой результатов и уведомлением при сбоях (Улучшение 5)"""
+        """Автоматическая проверка с обработкой результатов и уведомлением при сбоях"""
         try:
             result = self.fetch_vin_data()
             if result and result != "Доступных акций нет" and result != self.last_result:
@@ -111,7 +111,7 @@ class VinChecker:
                     timeout=10
                 )
 
-                # Обработка ответа (Улучшение 1: рефакторинг в отдельную функцию)
+                # Обработка ответа
                 return self.parse_response(response)
 
             except requests.RequestException as e:
@@ -119,7 +119,7 @@ class VinChecker:
                 return None
 
     def parse_response(self, response):
-        """Парсинг ответа сервера (Улучшение 1)"""
+        """Парсинг ответа сервера"""
         if response.status_code != 200:
             logging.error(f"Сервер вернул код {response.status_code}")
             return f"Сервер вернул код {response.status_code}"
