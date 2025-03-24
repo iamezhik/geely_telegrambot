@@ -2,9 +2,10 @@ import os
 import logging
 import telebot
 import requests
+import time
 from bs4 import BeautifulSoup
-from threading import Timer
 from dotenv import load_dotenv
+from apscheduler.schedulers.background import BackgroundScheduler
 
 # Настройка окружения и логгера
 load_dotenv()
@@ -12,32 +13,52 @@ logging.basicConfig(level=logging.INFO)
 
 class VinChecker:
     def __init__(self):
+        # Проверка обязательных переменных окружения
         self.bot = telebot.TeleBot(os.getenv('TELEGRAM_TOKEN'))
         self.vin = os.getenv('VIN_NUMBER')
         self.chat_id = os.getenv('CHAT_ID')
+        
+        # Валидация переменных
+        if not all([self.bot.token, self.vin, self.chat_id]):
+            raise ValueError("TELEGRAM_TOKEN, VIN_NUMBER, and CHAT_ID must be set in .env")
+        if not self.chat_id.isdigit():
+            raise ValueError("CHAT_ID must be a numeric string")
+        if len(self.vin) != 17 or not self.vin.isalnum():
+            raise ValueError("VIN_NUMBER must be a 17-character alphanumeric string")
+
         self.last_result = None
         self.check_interval = int(os.getenv('CHECK_INTERVAL', 86400))  # По умолчанию 24 часа
         
         # Регистрация обработчиков команд
         self.bot.message_handler(commands=['start', 'help'])(self.send_welcome)
         self.bot.message_handler(commands=['check'])(self.manual_check)
+        self.bot.message_handler(func=lambda message: True)(self.default_message)
+        
+        # Настройка планировщика
+        self.scheduler = BackgroundScheduler()
+        self.scheduler.add_job(self.automatic_check, 'interval', seconds=self.check_interval)
         
     def send_welcome(self, message):
         """Обработчик команд start/help"""
         self.bot.reply_to(message, "🔍 Бот для проверки технических акций Geely по VIN. Доступные команды:\n/check - ручная проверка")
 
-    def start_periodic_check(self):
-        """Запуск периодической проверки"""
-        self.schedule_check()
-        self.bot.polling(none_stop=True)
+    def default_message(self, message):
+        """Обработчик неизвестных сообщений"""
+        self.bot.reply_to(message, "Я понимаю только команды /start, /help и /check.")
 
-    def schedule_check(self):
-        """Планировщик периодической проверки"""
-        Timer(self.check_interval, self.schedule_check).start()
-        self.automatic_check()
+    def start(self):
+        """Запуск бота и периодических проверок с перезапуском при сбоях"""
+        self.scheduler.start()
+        logging.info("Периодические проверки запущены")
+        while True:
+            try:
+                self.bot.polling(none_stop=True)
+            except Exception as e:
+                logging.error(f"Ошибка в polling, перезапуск через 5 секунд: {str(e)}")
+                time.sleep(5)  # Задержка перед перезапуском
 
     def automatic_check(self):
-        """Автоматическая проверка с обработкой результатов"""
+        """Автоматическая проверка с обработкой результатов и уведомлением при сбоях"""
         try:
             result = self.fetch_vin_data()
             if result and result != "Доступных акций нет" and result != self.last_result:
@@ -45,7 +66,12 @@ class VinChecker:
                 self.bot.send_message(self.chat_id, f"🔔 Обновление статуса:\n{result}")
                 logging.info("Отправлено автоматическое уведомление")
         except Exception as e:
-            logging.error(f"Ошибка автоматической проверки: {str(e)}")
+            error_msg = f"⚠️ Критическая ошибка в автоматической проверке: {str(e)}"
+            logging.error(error_msg)
+            try:
+                self.bot.send_message(self.chat_id, error_msg)
+            except Exception as send_error:
+                logging.error(f"Не удалось отправить уведомление об ошибке: {str(send_error)}")
 
     def manual_check(self, message):
         """Ручная проверка по команде /check"""
@@ -54,7 +80,7 @@ class VinChecker:
             response = result if result else "⚠️ Не удалось получить данные"
             self.bot.reply_to(message, response)
         except Exception as e:
-            self.bot.reply_to(message, f"❌ Ошибка: {str(e)}")
+            self.bot.reply_to(message, "❌ Произошла ошибка. Пожалуйста, попробуйте позже.")
             logging.error(f"Ошибка ручной проверки: {str(e)}")
 
     def fetch_vin_data(self):
@@ -64,7 +90,8 @@ class VinChecker:
                 # Первичный запрос для получения cookies
                 session.get(
                     'https://www.geely-motors.com/for-owners/technical-center/technical-campaigns',
-                    headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+                    headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'},
+                    timeout=10
                 )
 
                 # Отправка POST-запроса
@@ -80,22 +107,40 @@ class VinChecker:
                         'Bx-ajax': 'true',
                         'X-Requested-With': 'XMLHttpRequest',
                         'Referer': 'https://www.geely-motors.com/for-owners/technical-center/technical-campaigns'
-                    }
+                    },
+                    timeout=10
                 )
 
-                if response.status_code == 200:
-                    data = response.json()
-                    if data.get('status') == 'success':
-                        soup = BeautifulSoup(data.get('html', ''), 'html.parser')
-                        result = soup.find('p', class_='technical-campaigns__vin-search-table-text')
-                        return result.text if result else "Доступных акций нет"
-                    return data.get('data', 'Ошибка при обработке запроса')
-                return "Сервер не ответил корректно"
+                # Обработка ответа
+                return self.parse_response(response)
 
             except requests.RequestException as e:
                 logging.error(f"Ошибка сети: {str(e)}")
                 return None
 
+    def parse_response(self, response):
+        """Парсинг ответа сервера"""
+        if response.status_code != 200:
+            logging.error(f"Сервер вернул код {response.status_code}")
+            return f"Сервер вернул код {response.status_code}"
+        
+        try:
+            data = response.json()
+        except ValueError:
+            logging.error(f"Ответ не в формате JSON: {response.text}")
+            return "Ответ не в формате JSON"
+
+        if data.get('status') == 'success':
+            soup = BeautifulSoup(data.get('html', ''), 'html.parser')
+            result = soup.find('p', class_='technical-campaigns__vin-search-table-text')
+            if result:
+                return result.text
+            error_message = soup.find('div', class_='error-message')
+            return error_message.text if error_message else "Доступных акций нет"
+        
+        logging.warning(f"Запрос не успешен: {data}")
+        return data.get('data', 'Ошибка при обработке запроса')
+
 if __name__ == '__main__':
     checker = VinChecker()
-    checker.start_periodic_check()
+    checker.start()
