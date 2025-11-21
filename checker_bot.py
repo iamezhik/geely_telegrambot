@@ -1,146 +1,390 @@
 import os
 import logging
-import telebot
-import requests
 import time
+from datetime import datetime
+
+import requests
+import telebot
+from apscheduler.schedulers.background import BackgroundScheduler
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from apscheduler.schedulers.background import BackgroundScheduler
 
-# Настройка окружения и логгера
 load_dotenv()
-logging.basicConfig(level=logging.INFO)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
 
 class VinChecker:
     def __init__(self):
-        # Проверка обязательных переменных окружения
-        self.bot = telebot.TeleBot(os.getenv('TELEGRAM_TOKEN'))
-        self.vin = os.getenv('VIN_NUMBER')
-        self.chat_id = os.getenv('CHAT_ID')
-        
-        # Валидация переменных
-        if not all([self.bot.token, self.vin, self.chat_id]):
-            raise ValueError("TELEGRAM_TOKEN, VIN_NUMBER, and CHAT_ID must be set in .env")
-        if not self.chat_id.isdigit():
-            raise ValueError("CHAT_ID must be a numeric string")
-        if len(self.vin) != 17 or not self.vin.isalnum():
-            raise ValueError("VIN_NUMBER must be a 17-character alphanumeric string")
+        # Environment variables validation
+        self.token = os.getenv("TELEGRAM_TOKEN")
+        self.vin = os.getenv("VIN_NUMBER")
+        self.chat_id = os.getenv("CHAT_ID")
+        self.check_interval = int(os.getenv("CHECK_INTERVAL", "86400"))
+        self.admin_ids = self._parse_admin_ids(os.getenv("ADMIN_IDS", ""))
 
+        if not all([self.token, self.vin, self.chat_id]):
+            raise ValueError("TELEGRAM_TOKEN, VIN_NUMBER и CHAT_ID обязательны в .env")
+
+        if not self.chat_id.lstrip("-").isdigit():
+            raise ValueError("CHAT_ID должен быть числом")
+
+        if len(self.vin) != 17 or not self.vin.isalnum():
+            raise ValueError("VIN_NUMBER должен быть 17-символьной буквенно-цифровой строкой")
+
+        self.bot = telebot.TeleBot(self.token)
         self.last_result = None
-        self.check_interval = int(os.getenv('CHECK_INTERVAL', 86400))  # По умолчанию 24 часа
-        
-        # Регистрация обработчиков команд
-        self.bot.message_handler(commands=['start', 'help'])(self.send_welcome)
-        self.bot.message_handler(commands=['check'])(self.manual_check)
-        self.bot.message_handler(func=lambda message: True)(self.default_message)
-        
-        # Настройка планировщика
+        self.last_check_time = None
+        self.start_time = datetime.now()
+        self.check_counter = 0
+
+        # URLs
+        self.base_url = "https://www.geely-motors.com"
+        self.campaigns_url = f"{self.base_url}/for-owners/technical-center/technical-campaigns"
+        self.ajax_url = f"{self.base_url}/local/ajax/technicalcampaigns_redesign.php"
+
+        # Modern browser headers to bypass WAF
+        self.headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+            "X-Requested-With": "XMLHttpRequest",
+            "Origin": self.base_url,
+            "Referer": self.campaigns_url,
+            "Sec-Ch-Ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Windows"',
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+        }
+
+        # Register handlers
+        self.bot.message_handler(commands=["start", "help"])(self.send_welcome)
+        self.bot.message_handler(commands=["check"])(self.manual_check)
+        self.bot.message_handler(commands=["status"])(self.check_status)
+        self.bot.message_handler(commands=["info"])(self.show_info)
+        self.bot.message_handler(func=lambda m: True)(self.default_message)
+
+        # Scheduler
         self.scheduler = BackgroundScheduler()
-        self.scheduler.add_job(self.automatic_check, 'interval', seconds=self.check_interval)
-        
+        self.scheduler.add_job(
+            self.automatic_check,
+            "interval",
+            seconds=self.check_interval,
+            id="vin_check"
+        )
+
+    @staticmethod
+    def _parse_admin_ids(admin_str):
+        """Parse comma-separated admin user IDs from env"""
+        if not admin_str:
+            return []
+        try:
+            return [int(uid.strip()) for uid in admin_str.split(",") if uid.strip()]
+        except ValueError:
+            logger.warning("Неверный формат ADMIN_IDS в .env, игнорируем")
+            return []
+
+    def _is_admin(self, user_id):
+        """Check if user is admin (has access to extended commands)"""
+        return user_id in self.admin_ids if self.admin_ids else True
+
     def send_welcome(self, message):
-        """Обработчик команд start/help"""
-        self.bot.reply_to(message, "🔍 Бот для проверки технических акций Geely по VIN. Доступные команды:\n/check - ручная проверка")
+        """Handler for /start and /help commands"""
+        text = (
+            "🔍 *Бот проверки технических акций Geely*\n\n"
+            f"VIN: `{self.vin}`\n"
+            f"Интервал: {self.check_interval // 3600}ч\n\n"
+            "*Команды:*\n"
+            "/check — ручная проверка акций\n"
+            "/status — диагностика сайта Geely\n"
+            "/info — статистика работы бота\n"
+            "/help — это сообщение"
+        )
+        self.bot.reply_to(message, text, parse_mode="Markdown")
 
     def default_message(self, message):
-        """Обработчик неизвестных сообщений"""
-        self.bot.reply_to(message, "Я понимаю только команды /start, /help и /check.")
+        """Handler for unknown messages"""
+        self.bot.reply_to(
+            message,
+            "❓ Неизвестная команда. Используйте /help для списка доступных команд."
+        )
+
+    def show_info(self, message):
+        """Show bot statistics and runtime info"""
+        uptime = datetime.now() - self.start_time
+        uptime_str = str(uptime).split('.')[0]  # Remove microseconds
+        
+        next_check = "неизвестно"
+        job = self.scheduler.get_job("vin_check")
+        if job and job.next_run_time:
+            next_check = job.next_run_time.strftime("%Y-%m-%d %H:%M:%S")
+
+        text = (
+            "📊 *Статистика бота*\n\n"
+            f"⏱ Аптайм: `{uptime_str}`\n"
+            f"🔢 Проверок выполнено: {self.check_counter}\n"
+            f"🕒 Последняя проверка: {self.last_check_time or 'еще не было'}\n"
+            f"⏭ Следующая проверка: {next_check}\n"
+            f"📋 Последний результат:\n{self.last_result or 'нет данных'}"
+        )
+        self.bot.reply_to(message, text, parse_mode="Markdown")
+
+    def check_status(self, message):
+        """Diagnostic command: check Geely website availability"""
+        self.bot.send_chat_action(message.chat.id, "typing")
+        
+        status_lines = ["🔍 *Диагностика сайта Geely*\n"]
+        
+        # Test 1: Main page availability
+        try:
+            resp = requests.get(self.campaigns_url, headers=self.headers, timeout=10)
+            status_lines.append(
+                f"✅ Главная страница: HTTP {resp.status_code} "
+                f"({len(resp.content)} bytes)"
+            )
+            
+            # Test 2: Check form presence
+            soup = BeautifulSoup(resp.text, "html.parser")
+            form = soup.find("form", {"id": "technical-campaigns-form"})
+            if form:
+                status_lines.append("✅ Форма проверки VIN: найдена")
+            else:
+                status_lines.append("⚠️ Форма проверки VIN: не найдена (структура изменена?)")
+            
+        except requests.Timeout:
+            status_lines.append("❌ Главная страница: таймаут (>10 сек)")
+        except requests.RequestException as e:
+            status_lines.append(f"❌ Главная страница: ошибка ({type(e).__name__})")
+
+        # Test 3: AJAX endpoint
+        try:
+            test_resp = requests.post(
+                self.ajax_url,
+                data={"ajaxAction": "test"},
+                headers=self.headers,
+                timeout=10
+            )
+            status_lines.append(f"✅ AJAX endpoint: HTTP {test_resp.status_code}")
+        except requests.Timeout:
+            status_lines.append("❌ AJAX endpoint: таймаут")
+        except requests.RequestException as e:
+            status_lines.append(f"❌ AJAX endpoint: ошибка ({type(e).__name__})")
+
+        # Test 4: DNS resolution
+        try:
+            import socket
+            ip = socket.gethostbyname("www.geely-motors.com")
+            status_lines.append(f"✅ DNS: `{ip}`")
+        except socket.gaierror:
+            status_lines.append("❌ DNS: не резолвится")
+
+        self.bot.reply_to(message, "\n".join(status_lines), parse_mode="Markdown")
 
     def start(self):
-        """Запуск бота и периодических проверок с перезапуском при сбоях"""
+        """Start bot polling and scheduler"""
+        logger.info(
+            "🚀 Запуск бота (VIN: %s, интервал: %s сек)",
+            self.vin,
+            self.check_interval
+        )
         self.scheduler.start()
-        logging.info("Периодические проверки запущены")
+        
+        # Send startup notification
+        try:
+            self.bot.send_message(
+                self.chat_id,
+                f"✅ Бот запущен\nVIN: `{self.vin}`\nПроверка каждые {self.check_interval // 3600}ч",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logger.error("Не удалось отправить уведомление о запуске: %s", e)
+
+        # Polling loop with auto-restart
         while True:
             try:
-                self.bot.polling(none_stop=True)
-            except Exception as e:
-                logging.error(f"Ошибка в polling, перезапуск через 5 секунд: {str(e)}")
-                time.sleep(5)  # Задержка перед перезапуском
+                self.bot.polling(none_stop=True, timeout=60, long_polling_timeout=60)
+            except Exception as exc:
+                logger.error("Ошибка polling: %s. Перезапуск через 15 сек", exc)
+                time.sleep(15)
 
     def automatic_check(self):
-        """Автоматическая проверка с обработкой результатов и уведомлением при сбоях"""
-        try:
-            result = self.fetch_vin_data()
-            if result and result != "Доступных акций нет" and result != self.last_result:
-                self.last_result = result
-                self.bot.send_message(self.chat_id, f"🔔 Обновление статуса:\n{result}")
-                logging.info("Отправлено автоматическое уведомление")
-        except Exception as e:
-            error_msg = f"⚠️ Критическая ошибка в автоматической проверке: {str(e)}"
-            logging.error(error_msg)
+        """Scheduled automatic check"""
+        logger.info("⏰ Автоматическая проверка #%s", self.check_counter + 1)
+        self.check_counter += 1
+        
+        result = self.fetch_vin_data()
+        self.last_check_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        if not result:
+            logger.warning("Проверка не удалась, пропускаем уведомление")
+            return
+
+        # Send notification only if status changed
+        if result != self.last_result:
+            self.last_result = result
+            
+            if "акций нет" in result.lower() or "не найдено" in result.lower():
+                msg = f"ℹ️ *Статус обновлен*\nДля VIN `{self.vin}` акции отсутствуют"
+            else:
+                msg = f"🔔 *Обнаружена акция!*\n\nVIN: `{self.vin}`\n\n{result}"
+            
             try:
-                self.bot.send_message(self.chat_id, error_msg)
-            except Exception as send_error:
-                logging.error(f"Не удалось отправить уведомление об ошибке: {str(send_error)}")
+                self.bot.send_message(self.chat_id, msg, parse_mode="Markdown")
+            except Exception as e:
+                logger.error("Ошибка отправки уведомления: %s", e)
 
     def manual_check(self, message):
-        """Ручная проверка по команде /check"""
-        try:
-            result = self.fetch_vin_data()
-            response = result if result else "⚠️ Не удалось получить данные"
-            self.bot.reply_to(message, response)
-        except Exception as e:
-            self.bot.reply_to(message, "❌ Произошла ошибка. Пожалуйста, попробуйте позже.")
-            logging.error(f"Ошибка ручной проверки: {str(e)}")
+        """Handler for /check command"""
+        logger.info("🖐 Ручная проверка от пользователя %s", message.from_user.id)
+        self.bot.send_chat_action(message.chat.id, "typing")
+        
+        result = self.fetch_vin_data()
+        self.last_check_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        if not result:
+            self.bot.reply_to(
+                message,
+                "⚠️ Не удалось получить данные от сайта Geely. "
+                "Попробуйте позже или используйте /status для диагностики."
+            )
+        else:
+            # Format response with emoji based on result
+            if "акций нет" in result.lower() or "не найдено" in result.lower():
+                prefix = "ℹ️ "
+            elif "ошибка" in result.lower():
+                prefix = "⚠️ "
+            else:
+                prefix = "✅ "
+            
+            self.bot.reply_to(message, f"{prefix}{result}")
 
     def fetch_vin_data(self):
-        """Основная логика получения данных по VIN"""
+        """Fetch VIN data from Geely website"""
         with requests.Session() as session:
             try:
-                # Первичный запрос для получения cookies
-                session.get(
-                    'https://www.geely-motors.com/for-owners/technical-center/technical-campaigns',
-                    headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'},
-                    timeout=10
+                # Step 1: GET main page to establish session
+                logger.debug("GET %s", self.campaigns_url)
+                initial = session.get(
+                    self.campaigns_url,
+                    headers=self.headers,
+                    timeout=15,
+                )
+                
+                if initial.status_code != 200:
+                    logger.error("Главная страница вернула код %s", initial.status_code)
+                    return f"Ошибка: сервер вернул код {initial.status_code}"
+
+                # Step 2: Extract session ID from cookies
+                sessid = (
+                    session.cookies.get("PHPSESSID")
+                    or session.cookies.get("BITRIX_SM_SALE_UID")
+                    or session.cookies.get("BX_USER_ID")
+                    or ""
+                )
+                logger.debug("Session ID: %s", "получен" if sessid else "отсутствует")
+
+                # Step 3: POST VIN check request
+                payload = {
+                    "vin": self.vin,
+                    "sessid": sessid,
+                    "ajaxAction": "checkVin",
+                    "componentName": "geely:technical.campaigns",
+                }
+
+                logger.debug("POST %s с VIN %s", self.ajax_url, self.vin)
+                resp = session.post(
+                    self.ajax_url,
+                    data=payload,
+                    headers=self.headers,
+                    timeout=15,
                 )
 
-                # Отправка POST-запроса
-                response = session.post(
-                    'https://www.geely-motors.com/local/ajax/technicalcampaigns_redesign.php',
-                    data={
-                        'vin': self.vin,
-                        'sessid': session.cookies.get('PHPSESSID', ''),
-                        'ajaxAction': 'checkVin',
-                        'componentName': 'geely:technical.campaigns'
-                    },
-                    headers={
-                        'Bx-ajax': 'true',
-                        'X-Requested-With': 'XMLHttpRequest',
-                        'Referer': 'https://www.geely-motors.com/for-owners/technical-center/technical-campaigns'
-                    },
-                    timeout=10
+                logger.info(
+                    "Ответ получен: HTTP %s, размер %s bytes",
+                    resp.status_code,
+                    len(resp.content)
                 )
+                
+                return self.parse_response(resp)
 
-                # Обработка ответа
-                return self.parse_response(response)
-
-            except requests.RequestException as e:
-                logging.error(f"Ошибка сети: {str(e)}")
+            except requests.Timeout:
+                logger.error("Таймаут запроса к сайту Geely")
+                return None
+            except requests.ConnectionError:
+                logger.error("Ошибка подключения к сайту Geely")
+                return None
+            except requests.RequestException as exc:
+                logger.error("Сетевая ошибка: %s", exc)
                 return None
 
     def parse_response(self, response):
-        """Парсинг ответа сервера"""
+        """Parse API response from Geely"""
         if response.status_code != 200:
-            logging.error(f"Сервер вернул код {response.status_code}")
-            return f"Сервер вернул код {response.status_code}"
-        
+            return f"Ошибка: сервер вернул код {response.status_code}"
+
         try:
             data = response.json()
         except ValueError:
-            logging.error(f"Ответ не в формате JSON: {response.text}")
-            return "Ответ не в формате JSON"
+            logger.error("Ответ не в формате JSON: %s", response.text[:200])
+            return "Ошибка: сервер вернул некорректный ответ (не JSON)"
 
-        if data.get('status') == 'success':
-            soup = BeautifulSoup(data.get('html', ''), 'html.parser')
-            result = soup.find('p', class_='technical-campaigns__vin-search-table-text')
-            if result:
-                return result.text
-            error_message = soup.find('div', class_='error-message')
-            return error_message.text if error_message else "Доступных акций нет"
+        if data.get("status") != "success":
+            error_msg = data.get("data") or data.get("message") or "Неизвестная ошибка"
+            logger.warning("API вернул ошибку: %s", error_msg)
+            return f"Ошибка API: {error_msg}"
+
+        html = data.get("html") or ""
+        if not html:
+            return "По VIN не найдено информации об акциях"
+
+        soup = BeautifulSoup(html, "html.parser")
+
+        # Try multiple selectors for result
+        result = (
+            soup.find("p", class_="technical-campaigns__vin-search-table-text")
+            or soup.find("div", class_="technical-campaigns__result")
+            or soup.find("div", class_="technical-campaigns__success")
+        )
         
-        logging.warning(f"Запрос не успешен: {data}")
-        return data.get('data', 'Ошибка при обработке запроса')
+        if result:
+            text = result.get_text(strip=True)
+            logger.info("Результат найден: %s", text[:50])
+            return text
 
-if __name__ == '__main__':
-    checker = VinChecker()
-    checker.start()
+        # Check for error message
+        error = soup.find("div", class_="error-message")
+        if error:
+            return error.get_text(strip=True)
+
+        # If structure unknown, log HTML for debugging
+        logger.warning("Неизвестная структура HTML ответа: %s", html[:300])
+        return "Структура ответа сайта изменилась, требуется обновление бота"
+
+
+def main():
+    """Entry point with error handling"""
+    try:
+        checker = VinChecker()
+        checker.start()
+    except KeyboardInterrupt:
+        logger.info("Получен сигнал остановки (Ctrl+C)")
+    except ValueError as e:
+        logger.critical("Ошибка конфигурации: %s", e)
+        raise
+    except Exception as e:
+        logger.critical("Критическая ошибка: %s", e, exc_info=True)
+        raise
+
+
+if __name__ == "__main__":
+    main()
