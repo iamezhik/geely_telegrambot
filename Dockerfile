@@ -1,17 +1,37 @@
-# Используем официальный образ Python
-FROM python:3.10-slim
+# Используем более свежую версию Python
+FROM python:3.11-slim
 
-# Рабочая директория
-WORKDIR /checker_bot
+# Переменные среды для оптимизации Python
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
 
-# Копируем зависимости
+# Создаем системного пользователя (безопасность)
+RUN groupadd -r botuser && useradd -r -g botuser botuser
+
+WORKDIR /app
+
+# Установка системных зависимостей
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
+# Установка часового пояса
+ENV TZ=Europe/Moscow
+
+# Сначала копируем requirements для кэширования слоя
 COPY requirements.txt .
+RUN pip install -r requirements.txt
 
-# Устанавливаем зависимости
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Копируем всё
+# Копируем код и меняем владельца
 COPY . .
+RUN chown -R botuser:botuser /app
 
-# Запускаем бота
+# Переключаемся на пользователя
+USER botuser
+
+# Healthcheck для мониторинга
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+  CMD pgrep python || exit 1
+
 CMD ["python", "checker_bot.py"]
