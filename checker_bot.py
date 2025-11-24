@@ -269,7 +269,7 @@ class VinChecker:
             self.bot.reply_to(message, f"{prefix}{result}")
 
     def fetch_vin_data(self):
-        """Запрос данных по VIN через новый REST API Geely"""
+        """Запрос данных по VIN через REST API Geely"""
 
         url = (
             "https://services.prod.geely.perx.ru/"
@@ -293,18 +293,22 @@ class VinChecker:
                 resp.status_code,
                 len(resp.content),
             )
-            if resp.status_code != 200:
-                return f"Ошибка: сервер Geely вернул код {resp.status_code}"
-            return self.parse_response(resp)
+            
+            # API возвращает 404 когда акций нет - это нормально!
+            if resp.status_code in [200, 404]:
+                return self.parse_response(resp)
+            else:
+                return f"Ошибка: сервер Geely вернул неожиданный код {resp.status_code}"
+                
         except requests.Timeout:
             logger.error("Таймаут запроса к сервису Geely")
-            return "Ошибка: таймаут запроса к сервису Geely"
+            return None
         except requests.ConnectionError:
             logger.error("Ошибка подключения к сервису Geely")
-            return "Ошибка: нет подключения к сервису Geely"
+            return None
         except requests.RequestException as exc:
             logger.error("Сетевая ошибка: %s", exc)
-            return f"Сетевая ошибка при обращении к сервису Geely: {exc}"
+            return None
 
     def parse_response(self, response):
         """Парсинг JSON-ответа от vin-checker-service"""
@@ -315,28 +319,33 @@ class VinChecker:
             logger.error("Ответ не в формате JSON: %s", response.text[:300])
             return "Ошибка: сервис Geely вернул некорректный ответ (не JSON)"
 
-        # Возможные варианты структуры: dict с ключом campaigns, dict с data, голый список
-        campaigns = None
+        # Проверяем поле success
+        if not data.get("success", False):
+            # API вернул success=false
+            errors = data.get("errors", [])
+            if errors and isinstance(errors, list):
+                error_msg = errors[0].get("message", "")
+                if "not found" in error_msg.lower() or "empty" in error_msg.lower():
+                    return "Уважаемый клиент, на Ваш автомобиль в данный момент нет действующих сервисных кампаний."
+                return f"Ошибка API: {error_msg}"
+            return "По VIN не найдено информации об акциях."
 
-        if isinstance(data, dict):
-            if isinstance(data.get("campaigns"), list):
-                campaigns = data["campaigns"]
-            elif isinstance(data.get("data"), list):
-                campaigns = data["data"]
-            elif isinstance(data.get("data", {}).get("campaigns"), list):
-                campaigns = data["data"]["campaigns"]
-        elif isinstance(data, list):
-            campaigns = data
-
-        if campaigns is None:
-            # Ничего похожего на список кампаний не нашли
-            logger.warning("Неожиданная структура ответа: %s", str(data)[:300])
-            # Пробуем вытащить человекочитаемое сообщение
-            msg = data.get("message") if isinstance(data, dict) else None
-            return msg or "По VIN не найдено информации об акциях."
+        # success=true, извлекаем данные
+        campaigns_data = data.get("data")
+        
+        if not campaigns_data:
+            return "По VIN не найдено информации об акциях."
+        
+        # Если data — это список кампаний
+        if isinstance(campaigns_data, list):
+            campaigns = campaigns_data
+        # Если data — это объект с полем campaigns
+        elif isinstance(campaigns_data, dict) and "campaigns" in campaigns_data:
+            campaigns = campaigns_data["campaigns"]
+        else:
+            campaigns = []
 
         if not campaigns:
-            # Пустой список кампаний — акций нет
             return "Уважаемый клиент, на Ваш автомобиль в данный момент нет действующих сервисных кампаний."
 
         # Формируем читаемый список акций
@@ -349,25 +358,19 @@ class VinChecker:
             title = camp.get("title") or camp.get("name") or "Без названия"
             desc = camp.get("description") or camp.get("details") or ""
             code = camp.get("code") or camp.get("campaignCode") or ""
-            date_from = camp.get("startDate") or camp.get("dateFrom") or ""
-            date_to = camp.get("endDate") or camp.get("dateTo") or ""
 
-            header = f"{idx}. {title}"
+            header = f"🔧 {title}"
             if code:
                 header += f" (код: {code})"
             lines.append(header)
 
             if desc:
-                lines.append(desc)
+                lines.append(f"  {desc}")
 
-            if date_from or date_to:
-                period = f"Период: {date_from or 'не указан'} — {date_to or 'не указан'}"
-                lines.append(period)
-
-            lines.append("")  # пустая строка между кампаниями
+            lines.append("")
 
         result = "\n".join(lines).strip()
-        logger.info("Сформирован текст результата длиной %s символов", len(result))
+        logger.info("Найдено кампаний: %s", len(campaigns))
         return result or "Информация об акциях получена, но не распознана."
 
 def main():
