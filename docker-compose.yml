@@ -1,11 +1,10 @@
 version: '3.8'
 
 services:
-  checker_bot:
-    container_name: checker-bot
+  bot:
     build: .
-    env_file:
-      - .env
-    volumes:
-      - ./.env:/checker_bot/.env
+    container_name: geely-checker
     restart: unless-stopped
+    env_file: .env
+    environment:
+      TZ: Europe/Moscow

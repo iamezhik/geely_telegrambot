@@ -269,107 +269,106 @@ class VinChecker:
             self.bot.reply_to(message, f"{prefix}{result}")
 
     def fetch_vin_data(self):
-        """Fetch VIN data from Geely website"""
-        with requests.Session() as session:
-            try:
-                # Step 1: GET main page to establish session
-                logger.debug("GET %s", self.campaigns_url)
-                initial = session.get(
-                    self.campaigns_url,
-                    headers=self.headers,
-                    timeout=15,
-                )
-                
-                if initial.status_code != 200:
-                    logger.error("Главная страница вернула код %s", initial.status_code)
-                    return f"Ошибка: сервер вернул код {initial.status_code}"
+        """Запрос данных по VIN через новый REST API Geely"""
 
-                # Step 2: Extract session ID from cookies
-                sessid = (
-                    session.cookies.get("PHPSESSID")
-                    or session.cookies.get("BITRIX_SM_SALE_UID")
-                    or session.cookies.get("BX_USER_ID")
-                    or ""
-                )
-                logger.debug("Session ID: %s", "получен" if sessid else "отсутствует")
+        url = (
+            "https://services.prod.geely.perx.ru/"
+            f"vin-checker-service/api/v1/technical-campaigns?vin={self.vin}"
+        )
+        headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Referer": "https://www.geely-motors.com/",
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/142.0.0.0 Safari/537.36"
+            ),
+        }
 
-                # Step 3: POST VIN check request
-                payload = {
-                    "vin": self.vin,
-                    "sessid": sessid,
-                    "ajaxAction": "checkVin",
-                    "componentName": "geely:technical.campaigns",
-                }
-
-                logger.debug("POST %s с VIN %s", self.ajax_url, self.vin)
-                resp = session.post(
-                    self.ajax_url,
-                    data=payload,
-                    headers=self.headers,
-                    timeout=15,
-                )
-
-                logger.info(
-                    "Ответ получен: HTTP %s, размер %s bytes",
-                    resp.status_code,
-                    len(resp.content)
-                )
-                
-                return self.parse_response(resp)
-
-            except requests.Timeout:
-                logger.error("Таймаут запроса к сайту Geely")
-                return None
-            except requests.ConnectionError:
-                logger.error("Ошибка подключения к сайту Geely")
-                return None
-            except requests.RequestException as exc:
-                logger.error("Сетевая ошибка: %s", exc)
-                return None
+        try:
+            logger.info("GET %s", url)
+            resp = requests.get(url, headers=headers, timeout=15)
+            logger.info(
+                "Ответ получен: HTTP %s, размер %s bytes",
+                resp.status_code,
+                len(resp.content),
+            )
+            if resp.status_code != 200:
+                return f"Ошибка: сервер Geely вернул код {resp.status_code}"
+            return self.parse_response(resp)
+        except requests.Timeout:
+            logger.error("Таймаут запроса к сервису Geely")
+            return "Ошибка: таймаут запроса к сервису Geely"
+        except requests.ConnectionError:
+            logger.error("Ошибка подключения к сервису Geely")
+            return "Ошибка: нет подключения к сервису Geely"
+        except requests.RequestException as exc:
+            logger.error("Сетевая ошибка: %s", exc)
+            return f"Сетевая ошибка при обращении к сервису Geely: {exc}"
 
     def parse_response(self, response):
-        """Parse API response from Geely"""
-        if response.status_code != 200:
-            return f"Ошибка: сервер вернул код {response.status_code}"
+        """Парсинг JSON-ответа от vin-checker-service"""
 
         try:
             data = response.json()
         except ValueError:
-            logger.error("Ответ не в формате JSON: %s", response.text[:200])
-            return "Ошибка: сервер вернул некорректный ответ (не JSON)"
+            logger.error("Ответ не в формате JSON: %s", response.text[:300])
+            return "Ошибка: сервис Geely вернул некорректный ответ (не JSON)"
 
-        if data.get("status") != "success":
-            error_msg = data.get("data") or data.get("message") or "Неизвестная ошибка"
-            logger.warning("API вернул ошибку: %s", error_msg)
-            return f"Ошибка API: {error_msg}"
+        # Возможные варианты структуры: dict с ключом campaigns, dict с data, голый список
+        campaigns = None
 
-        html = data.get("html") or ""
-        if not html:
-            return "По VIN не найдено информации об акциях"
+        if isinstance(data, dict):
+            if isinstance(data.get("campaigns"), list):
+                campaigns = data["campaigns"]
+            elif isinstance(data.get("data"), list):
+                campaigns = data["data"]
+            elif isinstance(data.get("data", {}).get("campaigns"), list):
+                campaigns = data["data"]["campaigns"]
+        elif isinstance(data, list):
+            campaigns = data
 
-        soup = BeautifulSoup(html, "html.parser")
+        if campaigns is None:
+            # Ничего похожего на список кампаний не нашли
+            logger.warning("Неожиданная структура ответа: %s", str(data)[:300])
+            # Пробуем вытащить человекочитаемое сообщение
+            msg = data.get("message") if isinstance(data, dict) else None
+            return msg or "По VIN не найдено информации об акциях."
 
-        # Try multiple selectors for result
-        result = (
-            soup.find("p", class_="technical-campaigns__vin-search-table-text")
-            or soup.find("div", class_="technical-campaigns__result")
-            or soup.find("div", class_="technical-campaigns__success")
-        )
-        
-        if result:
-            text = result.get_text(strip=True)
-            logger.info("Результат найден: %s", text[:50])
-            return text
+        if not campaigns:
+            # Пустой список кампаний — акций нет
+            return "Уважаемый клиент, на Ваш автомобиль в данный момент нет действующих сервисных кампаний."
 
-        # Check for error message
-        error = soup.find("div", class_="error-message")
-        if error:
-            return error.get_text(strip=True)
+        # Формируем читаемый список акций
+        lines = []
+        for idx, camp in enumerate(campaigns, start=1):
+            if not isinstance(camp, dict):
+                lines.append(f"{idx}. {camp}")
+                continue
 
-        # If structure unknown, log HTML for debugging
-        logger.warning("Неизвестная структура HTML ответа: %s", html[:300])
-        return "Структура ответа сайта изменилась, требуется обновление бота"
+            title = camp.get("title") or camp.get("name") or "Без названия"
+            desc = camp.get("description") or camp.get("details") or ""
+            code = camp.get("code") or camp.get("campaignCode") or ""
+            date_from = camp.get("startDate") or camp.get("dateFrom") or ""
+            date_to = camp.get("endDate") or camp.get("dateTo") or ""
 
+            header = f"{idx}. {title}"
+            if code:
+                header += f" (код: {code})"
+            lines.append(header)
+
+            if desc:
+                lines.append(desc)
+
+            if date_from or date_to:
+                period = f"Период: {date_from or 'не указан'} — {date_to or 'не указан'}"
+                lines.append(period)
+
+            lines.append("")  # пустая строка между кампаниями
+
+        result = "\n".join(lines).strip()
+        logger.info("Сформирован текст результата длиной %s символов", len(result))
+        return result or "Информация об акциях получена, но не распознана."
 
 def main():
     """Entry point with error handling"""
